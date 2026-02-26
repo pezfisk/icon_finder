@@ -1,0 +1,14 @@
+[package]
+name = "icon_finder"
+version = "1.0.0"
+edition = "2024"
+description = "Find the path to a Linux application icon by name and resolution."
+license = "GPLv3"
+repository = "https://github.com/pezfisk/icon_finder"
+homepage = "https://github.com/pezfisk/icon_finder"
+authors = ["Marco Rodriguez"]
+rust-version = "1.93"
+
+[[bin]]
+name = "icon_finder"
+path = "src/main.rs"
