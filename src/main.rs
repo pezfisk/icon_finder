@@ -21,6 +21,7 @@ fn main() {
         }
     };
 
+    let time = std::time::Instant::now();
     match find_icon(app, size) {
         Some(path) => println!("{}", path.display()),
         None => {
@@ -28,4 +29,6 @@ fn main() {
             process::exit(1);
         }
     }
+    let elapsed = time.elapsed();
+    println!("Time took to find icon: {:.2?}", elapsed);
 }
