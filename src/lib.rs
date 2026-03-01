@@ -9,6 +9,20 @@
 //!
 //! Results are cached after the first call — repeated calls for different apps
 //! reuse the pre-computed theme and directory lists.
+//!
+//! ## Example
+//!
+//! ```no_run
+//! use icon_finder::find_icon;
+//!
+//! if let Some(path) = find_icon("firefox", 128) {
+//!     println!("Icon found: {}", path.display());
+//! }
+//!
+//! if let Some(path) = find_icon("obs", 256) {
+//!     println!("OBS icon: {}", path.display());
+//! }
+//! ```
 
 use std::collections::BTreeSet;
 use std::env;
@@ -18,7 +32,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 /// Supported icon extensions in preference order.
-const EXTENSIONS: &[&str] = &["png", "svg", "xpm"];
+const EXTENSIONS: &[&str] = &["svg", "png", "xpm"];
 
 // ---------------------------------------------------------------------------
 // Cached globals — computed once per process, never again
@@ -26,6 +40,8 @@ const EXTENSIONS: &[&str] = &["png", "svg", "xpm"];
 
 static BASE_DIRS: OnceLock<Vec<PathBuf>> = OnceLock::new();
 static ACTIVE_THEME: OnceLock<String> = OnceLock::new();
+/// Cached index: maps icon stem → first resolved path, built lazily on first fuzzy search.
+static FUZZY_INDEX: OnceLock<Vec<String>> = OnceLock::new();
 
 fn base_dirs_cached() -> &'static [PathBuf] {
     BASE_DIRS.get_or_init(icon_base_dirs)
@@ -33,6 +49,96 @@ fn base_dirs_cached() -> &'static [PathBuf] {
 
 fn active_theme_cached() -> &'static str {
     ACTIVE_THEME.get_or_init(current_icon_theme)
+}
+
+/// Returns a cached, deduplicated list of all reverse-DNS icon stems found on
+/// the system. Built once by scanning only ONE size directory per theme (since
+/// icon names are identical across all sizes), then reused for every fuzzy query.
+fn fuzzy_index_cached(base_dirs: &[PathBuf]) -> &'static [String] {
+    FUZZY_INDEX.get_or_init(|| build_fuzzy_index(base_dirs))
+}
+
+/// Scan icon dirs to collect all reverse-DNS icon stems (names containing `.`).
+///
+/// For each theme, scans every `apps/` subdirectory across all size dirs.
+/// This is necessary because Flatpak apps may only ship icons at specific sizes
+/// (e.g. only `512x512/apps/`) so sampling a single size dir misses them.
+/// The number of size dirs per theme is small (10-20), so this is still fast.
+fn build_fuzzy_index(base_dirs: &[PathBuf]) -> Vec<String> {
+    let mut stems: BTreeSet<String> = BTreeSet::new();
+
+    for base in base_dirs {
+        if base.ends_with("pixmaps") {
+            continue;
+        }
+        let Ok(themes_rd) = fs::read_dir(base) else {
+            continue;
+        };
+
+        for theme_entry in themes_rd.flatten() {
+            let theme_path = theme_entry.path();
+            let Ok(meta) = fs::metadata(&theme_path) else {
+                continue;
+            };
+            if !meta.is_dir() {
+                continue;
+            }
+
+            // Walk every size dir, but only look inside `apps/` within each.
+            // Flatpak icons are always in apps/ — skipping other categories
+            // (mimetypes, devices, etc.) avoids indexing irrelevant names.
+            let Ok(sizes_rd) = fs::read_dir(&theme_path) else {
+                continue;
+            };
+            for size_entry in sizes_rd.flatten() {
+                let size_path = size_entry.path();
+                let Ok(meta) = fs::metadata(&size_path) else {
+                    continue;
+                };
+                if !meta.is_dir() {
+                    continue;
+                }
+
+                // Only look in apps/ — that's where Flatpak icons always live
+                let apps_dir = size_path.join("apps");
+                let dir_to_scan = if apps_dir.exists() {
+                    apps_dir
+                } else {
+                    // Some themes place icons directly in the size dir
+                    size_path
+                };
+
+                let Ok(files) = fs::read_dir(&dir_to_scan) else {
+                    continue;
+                };
+                for file in files.flatten() {
+                    let Ok(meta) = fs::metadata(file.path()) else {
+                        continue;
+                    };
+                    if !meta.is_file() {
+                        continue;
+                    }
+
+                    let fname = file.file_name();
+                    let Some(fname_str) = fname.to_str() else {
+                        continue;
+                    };
+
+                    let stem = match fname_str.rfind('.') {
+                        Some(i) => &fname_str[..i],
+                        None => fname_str,
+                    };
+
+                    // Only index reverse-DNS names (contain a dot)
+                    if stem.contains('.') {
+                        stems.insert(stem.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    stems.into_iter().collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -144,9 +250,11 @@ fn search_in_size_dir(size_dir: &Path, app: &str, buf: &mut PathBuf) -> Option<P
     let mut apps_dir: Option<PathBuf> = None;
 
     for entry in rd.flatten() {
-        // file_type() reads from the dirent on Linux — no extra stat syscall
-        let Ok(ft) = entry.file_type() else { continue };
-        if !ft.is_dir() {
+        // Use fs::metadata() to follow symlinks — Nix/Flatpak dirs use them heavily.
+        let Ok(meta) = fs::metadata(entry.path()) else {
+            continue;
+        };
+        if !meta.is_dir() {
             continue;
         }
         let path = entry.path();
@@ -212,8 +320,10 @@ fn collect_size_dirs(base_dirs: &[PathBuf], theme: &str, size: u32) -> Vec<SizeD
         };
 
         for entry in rd.flatten() {
-            let Ok(ft) = entry.file_type() else { continue };
-            if !ft.is_dir() {
+            let Ok(meta) = fs::metadata(entry.path()) else {
+                continue;
+            };
+            if !meta.is_dir() {
                 continue;
             }
 
@@ -298,11 +408,11 @@ fn matches_query(icon_stem: &str, query: &str) -> bool {
     false
 }
 
-/// Scan icon dirs for reverse-DNS names matching `query`, AND immediately try
-/// to resolve each hit — returning the first icon path found.
+/// Search for a fuzzy reverse-DNS match for `query`.
 ///
-/// This merges the old two-pass approach (collect candidates, then search) into
-/// a single directory walk, halving the number of syscalls on a fuzzy hit.
+/// Uses a pre-built index of all reverse-DNS icon stems on the system,
+/// which is computed once and cached. Subsequent calls just filter the
+/// in-memory list and do a targeted search — no directory walking.
 fn find_fuzzy(
     query: &str,
     base_dirs: &[PathBuf],
@@ -310,98 +420,30 @@ fn find_fuzzy(
     other_themes: &BTreeSet<String>,
     size: u32,
 ) -> Option<PathBuf> {
-    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let index = fuzzy_index_cached(base_dirs);
 
-    for base in base_dirs {
-        let Ok(themes_rd) = fs::read_dir(base) else {
-            continue;
-        };
+    // Filter the cached stem list — pure memory operation, no I/O
+    let matches: Vec<&str> = index
+        .iter()
+        .filter(|stem| matches_query(stem, query))
+        .map(|s| s.as_str())
+        .collect();
 
-        for theme_entry in themes_rd.flatten() {
-            let Ok(ft) = theme_entry.file_type() else {
-                continue;
-            };
-            if !ft.is_dir() {
-                continue;
+    for candidate in matches {
+        for theme in priority_themes {
+            if let Some(p) = find_in_theme_all_bases(base_dirs, theme, candidate, size) {
+                return Some(p);
             }
-
-            let theme_path = theme_entry.path();
-            let Ok(sizes_rd) = fs::read_dir(&theme_path) else {
-                continue;
-            };
-
-            for size_entry in sizes_rd.flatten() {
-                let Ok(ft) = size_entry.file_type() else {
-                    continue;
-                };
-                if !ft.is_dir() {
-                    continue;
-                }
-
-                let size_path = size_entry.path();
-
-                // Collect dirs to scan: size_path itself + its subdirs
-                let mut scan_dirs = vec![size_path.clone()];
-                if let Ok(cats) = fs::read_dir(&size_path) {
-                    for cat in cats.flatten() {
-                        let Ok(ft) = cat.file_type() else { continue };
-                        if ft.is_dir() {
-                            scan_dirs.push(cat.path());
-                        }
-                    }
-                }
-
-                for dir in &scan_dirs {
-                    let Ok(files) = fs::read_dir(dir) else {
-                        continue;
-                    };
-                    for file in files.flatten() {
-                        let Ok(ft) = file.file_type() else { continue };
-                        if !ft.is_file() {
-                            continue;
-                        }
-
-                        let fname = file.file_name();
-                        let fname_str = match fname.to_str() {
-                            Some(s) => s,
-                            None => continue,
-                        };
-
-                        // Strip extension
-                        let stem = match fname_str.rfind('.') {
-                            Some(i) => &fname_str[..i],
-                            None => fname_str,
-                        };
-
-                        if !matches_query(stem, query) || seen.contains(stem) {
-                            continue;
-                        }
-                        seen.insert(stem.to_string());
-
-                        // Try to resolve this candidate immediately
-                        let candidate = stem.to_string();
-                        for theme in priority_themes {
-                            if let Some(p) =
-                                find_in_theme_all_bases(base_dirs, theme, &candidate, size)
-                            {
-                                return Some(p);
-                            }
-                        }
-                        for theme in other_themes {
-                            if let Some(p) =
-                                find_in_theme_all_bases(base_dirs, theme, &candidate, size)
-                            {
-                                return Some(p);
-                            }
-                        }
-                        for b in base_dirs {
-                            if b.ends_with("pixmaps") {
-                                if let Some(p) = find_flat(b, &candidate) {
-                                    return Some(p);
-                                }
-                            }
-                        }
-                    }
+        }
+        for theme in other_themes {
+            if let Some(p) = find_in_theme_all_bases(base_dirs, theme, candidate, size) {
+                return Some(p);
+            }
+        }
+        for b in base_dirs {
+            if b.ends_with("pixmaps") {
+                if let Some(p) = find_flat(b, candidate) {
+                    return Some(p);
                 }
             }
         }
@@ -441,7 +483,7 @@ pub fn find_icon(app: &str, size: u32) -> Option<PathBuf> {
         }
         let Ok(rd) = fs::read_dir(base) else { continue };
         for name in rd.flatten().filter_map(|e| {
-            e.file_type().ok().filter(|ft| ft.is_dir())?;
+            fs::metadata(e.path()).ok().filter(|m| m.is_dir())?;
             e.file_name().into_string().ok()
         }) {
             if !priority_themes.contains(&name.as_str()) {
